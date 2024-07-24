@@ -1,5 +1,7 @@
 import { Route, ViewType } from '@/types';
 import got from '@/utils/got';
+import ofetch from '@/utils/ofetch';
+import { load } from 'cheerio';
 import timezone from '@/utils/timezone';
 
 const getTrueHour = (rank_type, rank_id, hour) => {
@@ -14,7 +16,7 @@ const getTrueHour = (rank_type, rank_id, hour) => {
 };
 
 export const route: Route = {
-    path: '/ranking/:rank_type/:rank_id/:hour',
+    path: '/ranking/:rank_type/:rank_id/:hour/:req_score?/:req_min_num?',
     categories: ['shopping', 'popular'],
     view: ViewType.Notifications,
     example: '/smzdm/ranking/pinlei/11/3',
@@ -209,10 +211,12 @@ export const route: Route = {
 };
 
 async function handler(ctx) {
-    const { rank_type, rank_id, hour } = ctx.req.param();
+    const { rank_type, rank_id, hour, req_score, req_min_num } = ctx.req.param();
 
     // When the hour is 3, some special rank_id require a special hour num
     const true_hour = getTrueHour(rank_type, rank_id, hour);
+    const score = +req_score;
+    const min_num = +req_min_num;
 
     const response = await got(`https://www.smzdm.com/top/json_more`, {
         headers: {
@@ -238,6 +242,34 @@ async function handler(ctx) {
     }
     const list = [...list1, ...list2];
 
+    if (!Number.isNaN(score)) {
+        const details = await fetchDetail(list.map((item) => item.article_url));
+        const items = [];
+        for (const item of list) {
+            const detail = details[item.article_url];
+            if (!((Number.isNaN(score) || detail.score >= score) &&
+                  (Number.isNaN(min_num) || detail.worthy + detail.unworthy >= min_num)
+            )) {
+                continue;
+            }
+
+            items.push({
+                title: `${item.article_title} - ${item.article_price}`,
+                description: `${detail.score}%(${detail.worthy}/${detail.unworthy})-${item.article_price}/${detail.ori_price}-${detail.source}<br>${detail.desc}<br>${detail.ai_desc} <br><img src="${item.article_pic}">`,
+                pubDate: timezone(detail.create_time, +8),
+                link: item.article_url,
+                author: detail.author,
+            });
+        }
+
+        return {
+            title: `${rank_type}榜-${rank_id}-${hour}小时`,
+            link: 'https://www.smzdm.com/top/',
+            allowEmpty: true,
+            item: items,
+        };
+    }
+
     return {
         title: `${rank_type}榜-${rank_id}-${hour}小时`,
         link: 'https://www.smzdm.com/top/',
@@ -249,4 +281,31 @@ async function handler(ctx) {
             link: item.article_url,
         })),
     };
+}
+
+async function fetchDetail(urls) {
+    const results = {};
+    for (const url of urls) {
+      const response = await ofetch(url);
+      const $ = load(response);
+      const score_rate = $('div.score_rate');
+      const ai = $('div.advantage').parent();
+      const item = {
+        worthy: +score_rate.find('#rating_worthy_num').text(),
+        unworthy: +score_rate.find('#rating_unworthy_num').text(),
+        score: 0,
+        source: $('div.structuration-box').find('span').first().text(),
+        desc: $('div.introduce-desc-content').html(),
+        advantage: ai.find('.advantage').text(),
+        disadvantage: ai.find('.disadvantage').text(),
+        suggestion: ai.find('.suggestion').text(),
+        author: $('div.author-blo2').find('.txt').first().text(),
+        ori_price: $('span.line-through').text(),
+        create_time: $('meta[name="weibo:webpage:create_at"]').attr('content'),
+        update_time: $('meta[name="weibo:webpage:update_at"]').attr('content'),
+      };
+      item.score = Math.floor(item.worthy * 100 / (item.worthy + item.unworthy));
+      results[url] = item;
+    }
+    return results;
 }
